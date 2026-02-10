@@ -1,12 +1,16 @@
+import io
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
 
 # ======================================================
 # CONFIG
@@ -14,13 +18,14 @@ from googleapiclient.discovery import build
 st.set_page_config(
     page_title="Yvora | Fichas Técnicas",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 # ======================================================
 # ESTILO YVORA (iPad 10")
 # ======================================================
-st.markdown("""
+st.markdown(
+    """
 <style>
 html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial; }
 .stApp { background-color: #EFE7DD; }
@@ -45,7 +50,9 @@ html, body, [class*="css"] { font-family: -apple-system, BlinkMacSystemFont, "Se
 hr { border: none; border-top: 1px solid rgba(0,0,0,0.08); margin: 10px 0; }
 .muted { color: rgba(0,0,0,0.55); font-size: 12px; }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # ======================================================
 # LOGO (na raiz do repo)
@@ -55,6 +62,7 @@ LOGO_CANDIDATES = [
     "yvora_logo.png", "yvora_logo.jpg", "yvora_logo.jpeg", "yvora_logo.webp",
 ]
 
+
 def find_logo_path() -> str | None:
     base = Path(__file__).parent
     for name in LOGO_CANDIDATES:
@@ -63,8 +71,9 @@ def find_logo_path() -> str | None:
             return str(p)
     return None
 
+
 # ======================================================
-# LINK HELPERS (Drive, YouTube, etc)
+# LINK HELPERS (Drive, etc)
 # ======================================================
 def extract_drive_file_id(url: str) -> str | None:
     if not url:
@@ -85,68 +94,168 @@ def extract_drive_file_id(url: str) -> str | None:
 
     return None
 
-def normalize_image_url(url: str) -> str:
-    if not url:
-        return ""
-    u = url.strip()
 
-    if "drive.google.com" in u:
-        fid = extract_drive_file_id(u)
-        if fid:
-            return f"https://drive.google.com/uc?export=view&id={fid}"
+def normalize_drive_direct_view(url: str) -> str:
+    fid = extract_drive_file_id(url)
+    if not fid:
+        return url
+    return f"https://drive.google.com/uc?export=view&id={fid}"
 
-    return u
 
 def drive_preview_url(url: str) -> str | None:
-    if not url:
-        return None
-    u = url.strip()
-    if "drive.google.com" not in u:
-        return None
-    fid = extract_drive_file_id(u)
+    fid = extract_drive_file_id(url)
     if not fid:
         return None
     return f"https://drive.google.com/file/d/{fid}/preview"
 
+
 # ======================================================
-# GOOGLE SHEETS
+# GOOGLE APIS
 # ======================================================
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Precisamos de Sheets + Drive para ler chips e baixar mídia
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
 
 @st.cache_resource
-def get_service():
-    creds = Credentials.from_service_account_info(
+def get_creds():
+    return Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
-        scopes=SCOPES
+        scopes=SCOPES,
     )
-    return build("sheets", "v4", credentials=creds)
+
+
+@st.cache_resource
+def sheets_service():
+    return build("sheets", "v4", credentials=get_creds())
+
+
+@st.cache_resource
+def drive_service():
+    return build("drive", "v3", credentials=get_creds())
+
+
+def _get_sheet_id_by_title(spreadsheet_id: str, title: str) -> int | None:
+    meta = sheets_service().spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title))",
+    ).execute()
+
+    for sh in meta.get("sheets", []):
+        props = sh.get("properties", {})
+        if props.get("title") == title:
+            return int(props.get("sheetId"))
+    return None
+
 
 @st.cache_data(ttl=30)
-def read_sheet(tab: str) -> pd.DataFrame:
-    service = get_service()
-    result = service.spreadsheets().values().get(
-        spreadsheetId=st.secrets["SHEET_ID"],
-        range=tab
+def read_sheet_values(tab: str) -> pd.DataFrame:
+    """Leitura simples: pega valores (sem hyperlinks de smart chips)."""
+    ssid = st.secrets["SHEET_ID"]
+    result = sheets_service().spreadsheets().values().get(
+        spreadsheetId=ssid,
+        range=tab,
     ).execute()
 
     values = result.get("values", [])
     if not values:
         return pd.DataFrame()
-
     cols = values[0]
     return pd.DataFrame(values[1:], columns=cols)
 
-def write_sheet(tab: str, df: pd.DataFrame):
-    service = get_service()
-    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
-    service.spreadsheets().values().update(
-        spreadsheetId=st.secrets["SHEET_ID"],
-        range=f"{tab}!A1",
-        valueInputOption="RAW",
-        body={"values": values}
+
+@st.cache_data(ttl=30)
+def read_sheet_with_hyperlinks(tab: str) -> pd.DataFrame:
+    """
+    Leitura robusta: captura hyperlinks (inclui Drive smart chips).
+    Usa spreadsheets.get(includeGridData) e extrai cell.hyperlink.
+    """
+    ssid = st.secrets["SHEET_ID"]
+    sid = _get_sheet_id_by_title(ssid, tab)
+    if sid is None:
+        return read_sheet_values(tab)
+
+    resp = sheets_service().spreadsheets().get(
+        spreadsheetId=ssid,
+        ranges=[tab],
+        includeGridData=True,
+        fields="sheets(data(rowData(values(formattedValue,hyperlink))))",
     ).execute()
 
-    read_sheet.clear()
+    sheets = resp.get("sheets", [])
+    if not sheets:
+        return pd.DataFrame()
+
+    data = sheets[0].get("data", [])
+    if not data:
+        return pd.DataFrame()
+
+    rowData = data[0].get("rowData", [])
+    if not rowData:
+        return pd.DataFrame()
+
+    # Primeiro row = headers
+    header_vals = rowData[0].get("values", [])
+    headers: list[str] = []
+    for cell in header_vals:
+        headers.append(str(cell.get("formattedValue", "")).strip())
+
+    headers = [h if h else f"col_{i+1}" for i, h in enumerate(headers)]
+
+    rows: list[list[str]] = []
+    for r in rowData[1:]:
+        vals = r.get("values", [])
+        out_row: list[str] = []
+        for i, cell in enumerate(vals):
+            fv = str(cell.get("formattedValue", "") or "").strip()
+            hl = str(cell.get("hyperlink", "") or "").strip()
+
+            # Se houver hyperlink (chip), preserva o link.
+            # Se o texto for vazio ou for um "nome de arquivo", ainda assim usamos o hyperlink.
+            # Se não houver hyperlink, usa o texto.
+            if hl:
+                out_row.append(hl)
+            else:
+                out_row.append(fv)
+        # garante tamanho
+        if len(out_row) < len(headers):
+            out_row += [""] * (len(headers) - len(out_row))
+        rows.append(out_row[: len(headers)])
+
+    df = pd.DataFrame(rows, columns=headers)
+    return df
+
+
+def write_sheet(tab: str, df: pd.DataFrame):
+    """Escreve em RAW (texto). Hyperlinks viram texto do link, o que é ótimo para o app."""
+    ssid = st.secrets["SHEET_ID"]
+    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+    sheets_service().spreadsheets().values().update(
+        spreadsheetId=ssid,
+        range=f"{tab}!A1",
+        valueInputOption="RAW",
+        body={"values": values},
+    ).execute()
+
+    read_sheet_values.clear()
+    read_sheet_with_hyperlinks.clear()
+
+
+# ======================================================
+# DRIVE MEDIA (bytes)
+# ======================================================
+@st.cache_data(ttl=300)
+def drive_download_bytes(file_id: str) -> bytes:
+    req = drive_service().files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return fh.getvalue()
+
 
 # ======================================================
 # AUTH
@@ -154,19 +263,22 @@ def write_sheet(tab: str, df: pd.DataFrame):
 ROLE_LABEL = {"viewer": "Cozinha", "editor": "Chefe", "admin": "Administrador"}
 REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "can_pratos"]
 
+
 def logout():
-    st.session_state.pop("auth", None)
-    st.session_state.pop("item", None)
-    st.session_state.pop("login_user", None)
-    st.session_state.pop("login_pass", None)
-    st.session_state.pop("confirm_delete", None)
-    st.session_state.pop("creating_new", None)
+    for k in [
+        "auth", "item", "login_user", "login_pass",
+        "confirm_delete", "creating_new",
+    ]:
+        st.session_state.pop(k, None)
+
 
 def is_admin() -> bool:
     return st.session_state.get("auth", {}).get("role") == "admin"
 
+
 def can_edit() -> bool:
     return st.session_state.get("auth", {}).get("role") in ["admin", "editor"]
+
 
 def has_access(module_type: str) -> bool:
     auth = st.session_state.get("auth", {})
@@ -178,10 +290,12 @@ def has_access(module_type: str) -> bool:
         return auth.get("can_drinks") == "1"
     return auth.get("can_pratos") == "1"
 
+
 def validate_users_df(users: pd.DataFrame):
     missing = [c for c in REQUIRED_USER_COLS if c not in users.columns]
     if missing:
         raise ValueError(f"Faltam colunas na aba users: {', '.join(missing)}")
+
 
 def login(users: pd.DataFrame):
     validate_users_df(users)
@@ -224,6 +338,7 @@ def login(users: pd.DataFrame):
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ======================================================
 # HEADER
 # ======================================================
@@ -245,12 +360,12 @@ def header():
             </div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     lp = find_logo_path()
     if lp:
-        colA, colB = st.columns([1, 3])
+        colA, _ = st.columns([1, 3])
         with colA:
             st.image(lp, use_container_width=True)
 
@@ -263,11 +378,13 @@ def header():
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ======================================================
-# ITENS helpers
+# ITENS
 # ======================================================
 BASE_ITEM_COLS = ["id", "type", "name"]
 PREFERRED_GENERAL_ORDER = ["name", "category", "tags", "yield", "total_time_min", "cover_photo_url", "training_video_url"]
+
 
 def ensure_item_min_schema(items: pd.DataFrame) -> pd.DataFrame:
     out = items.copy()
@@ -276,11 +393,12 @@ def ensure_item_min_schema(items: pd.DataFrame) -> pd.DataFrame:
             out[c] = ""
     return out
 
+
 def next_id(items: pd.DataFrame, prefix: str) -> str:
     if items.empty or "id" not in items.columns:
         return f"{prefix}001"
     ids = items["id"].astype(str).tolist()
-    nums = []
+    nums: list[int] = []
     for x in ids:
         if x.startswith(prefix):
             tail = x.replace(prefix, "")
@@ -288,6 +406,7 @@ def next_id(items: pd.DataFrame, prefix: str) -> str:
                 nums.append(int(tail))
     n = max(nums) + 1 if nums else 1
     return f"{prefix}{str(n).zfill(3)}"
+
 
 def upsert_item(items: pd.DataFrame, item: dict) -> pd.DataFrame:
     out = ensure_item_min_schema(items.copy())
@@ -312,14 +431,17 @@ def upsert_item(items: pd.DataFrame, item: dict) -> pd.DataFrame:
 
     return out
 
+
 def delete_item(items: pd.DataFrame, item_id: str) -> pd.DataFrame:
     if items.empty:
         return items
     return items[items["id"].astype(str) != str(item_id)].copy()
 
+
 def prettify_label(col: str) -> str:
     s = col.replace("_", " ").strip()
     return s[:1].upper() + s[1:] if s else col
+
 
 def get_mode_cols(all_cols: list[str], prefix: str) -> list[str]:
     pref = [c for c in all_cols if c.startswith(prefix)]
@@ -331,7 +453,7 @@ def get_mode_cols(all_cols: list[str], prefix: str) -> list[str]:
         f"{prefix}details",
         f"{prefix}common_mistakes",
     ]
-    ordered = []
+    ordered: list[str] = []
     for p in priority:
         if p in pref:
             ordered.append(p)
@@ -339,6 +461,7 @@ def get_mode_cols(all_cols: list[str], prefix: str) -> list[str]:
         if c not in ordered:
             ordered.append(c)
     return ordered
+
 
 def get_general_cols(all_cols: list[str]) -> tuple[list[str], list[str]]:
     gens = [c for c in PREFERRED_GENERAL_ORDER if c in all_cols]
@@ -351,6 +474,7 @@ def get_general_cols(all_cols: list[str]) -> tuple[list[str], list[str]]:
     ]
     return gens, sorted(extras)
 
+
 def render_text_sections(item: dict, cols: list[str]):
     any_shown = False
     for c in cols:
@@ -362,29 +486,43 @@ def render_text_sections(item: dict, cols: list[str]):
     if not any_shown:
         st.info("Sem informações preenchidas neste modo.")
 
+
 def render_media(item: dict, all_cols: list[str]):
+    # FOTO
     if "cover_photo_url" in all_cols:
         raw = str(item.get("cover_photo_url", "")).strip()
         if raw:
-            img = normalize_image_url(raw)
-            try:
-                st.image(img, use_container_width=True)
-            except Exception:
-                st.warning("Não consegui renderizar a imagem. Confira se o link é público. Vou mostrar o link abaixo.")
-                st.code(img)
+            # Se for Drive: tenta baixar bytes via API (funciona com chip e também com link não público se estiver compartilhado com service account)
+            fid = extract_drive_file_id(raw)
+            if fid:
+                try:
+                    b = drive_download_bytes(fid)
+                    st.image(b, use_container_width=True)
+                except Exception:
+                    # fallback: tenta link direto
+                    st.image(normalize_drive_direct_view(raw), use_container_width=True)
+            else:
+                st.image(raw, use_container_width=True)
 
+    # VÍDEO
     if "training_video_url" in all_cols:
         rawv = str(item.get("training_video_url", "")).strip()
         if rawv:
-            prev = drive_preview_url(rawv)
-            if prev:
-                components.iframe(prev, height=360)
-                st.link_button("Abrir vídeo", rawv, use_container_width=True)
-            else:
+            fidv = extract_drive_file_id(rawv)
+            if fidv:
                 try:
-                    st.video(rawv)
+                    b = drive_download_bytes(fidv)
+                    st.video(b)
                 except Exception:
+                    # fallback: preview iframe (se carregar) ou link
+                    prev = drive_preview_url(rawv)
+                    if prev:
+                        components.iframe(prev, height=420)
                     st.link_button("Abrir vídeo", rawv, use_container_width=True)
+            else:
+                # YouTube ou mp4 direto
+                st.video(rawv)
+
 
 # ======================================================
 # APP
@@ -395,8 +533,9 @@ def main():
     users_tab = st.secrets.get("USERS_TAB", "users")
     items_tab = st.secrets.get("ITEMS_TAB", "items")
 
+    # users não tem chip, pode ser leitura simples
     try:
-        users = read_sheet(users_tab)
+        users = read_sheet_values(users_tab)
     except Exception as e:
         st.error(f"Erro lendo aba users: {e}")
         return
@@ -408,8 +547,9 @@ def main():
             st.error(str(e))
         return
 
+    # items precisa ler hyperlinks de chip
     try:
-        items = read_sheet(items_tab)
+        items = read_sheet_with_hyperlinks(items_tab)
         items = ensure_item_min_schema(items)
     except Exception as e:
         st.error(f"Erro lendo aba items: {e}")
@@ -417,7 +557,7 @@ def main():
 
     auth = st.session_state["auth"]
 
-    allowed_modules = []
+    allowed_modules: list[str] = []
     if auth.get("role") == "admin":
         allowed_modules = ["Drinks", "Pratos"]
     else:
@@ -507,7 +647,7 @@ def main():
 
     render_media(item, all_cols)
 
-    meta_parts = []
+    meta_parts: list[str] = []
     for c in ["category", "yield", "total_time_min"]:
         if c in all_cols:
             v = str(item.get(c, "")).strip()
@@ -538,6 +678,7 @@ def main():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # ADMIN CRUD completo com sync para planilha
     if is_admin():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Administrador · Gerenciar item")
@@ -561,9 +702,9 @@ def main():
             edited["tags"] = st.text_input("Tags (separadas por vírgula)", value=str(item.get("tags", "")))
 
         if "cover_photo_url" in all_cols:
-            edited["cover_photo_url"] = st.text_input("Foto capa (URL, pode ser Drive)", value=str(item.get("cover_photo_url", "")))
+            edited["cover_photo_url"] = st.text_input("Foto capa (URL ou Drive)", value=str(item.get("cover_photo_url", "")))
         if "training_video_url" in all_cols:
-            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL, pode ser Drive)", value=str(item.get("training_video_url", "")))
+            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL ou Drive)", value=str(item.get("training_video_url", "")))
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
@@ -589,7 +730,7 @@ def main():
                     write_sheet(items_tab, items2)
                     st.session_state["creating_new"] = False
                     st.success("Salvo e sincronizado com a planilha.")
-                    time.sleep(0.5)
+                    time.sleep(0.4)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Falha ao salvar: {e}")
@@ -610,7 +751,7 @@ def main():
                         st.session_state.pop("confirm_delete", None)
                         st.session_state.pop("item", None)
                         st.success("Item excluído e sincronizado com a planilha.")
-                        time.sleep(0.5)
+                        time.sleep(0.4)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao excluir: {e}")
@@ -621,6 +762,7 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # EDITOR (Chefe)
     elif can_edit():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Chefe · Editar conteúdo")
@@ -628,9 +770,9 @@ def main():
         edited = dict(item)
 
         if "cover_photo_url" in all_cols:
-            edited["cover_photo_url"] = st.text_input("Foto capa (URL, pode ser Drive)", value=str(item.get("cover_photo_url", "")))
+            edited["cover_photo_url"] = st.text_input("Foto capa (URL ou Drive)", value=str(item.get("cover_photo_url", "")))
         if "training_video_url" in all_cols:
-            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL, pode ser Drive)", value=str(item.get("training_video_url", "")))
+            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL ou Drive)", value=str(item.get("training_video_url", "")))
 
         service_cols = get_mode_cols(all_cols, "service_")
         training_cols = get_mode_cols(all_cols, "training_")
@@ -648,14 +790,15 @@ def main():
                 items2 = upsert_item(items, edited)
                 write_sheet(items_tab, items2)
                 st.success("Alterações salvas e sincronizadas com a planilha.")
-                time.sleep(0.5)
+                time.sleep(0.4)
                 st.rerun()
             except Exception as e:
                 st.error(f"Falha ao salvar: {e}")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+
 # ======================================================
-# START (IMPORTANTE: apenas 1 chamada)
+# START (apenas 1 chamada)
 # ======================================================
 main()
