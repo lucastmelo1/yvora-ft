@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from google.oauth2.service_account import Credentials
+from google.oauthTFJGJW1zZSN3J64vHT89Dm_GW2ExdmdTtKvQnH7ndw.edit?gid=1916489109#gid=1916489109.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -73,7 +73,7 @@ def find_logo_path() -> str | None:
 
 
 # ======================================================
-# LINK HELPERS (Drive, etc)
+# LINK HELPERS (Drive, YouTube, etc)
 # ======================================================
 def extract_drive_file_id(url: str) -> str | None:
     if not url:
@@ -107,6 +107,43 @@ def drive_preview_url(url: str) -> str | None:
     if not fid:
         return None
     return f"https://drive.google.com/file/d/{fid}/preview"
+
+
+# ========= YouTube normalizer (fix definitivo para Shorts) =========
+def extract_youtube_id(url: str) -> str | None:
+    if not url:
+        return None
+    u = url.strip()
+
+    # youtu.be/VIDEO_ID
+    m = re.search(r"youtu\.be/([a-zA-Z0-9_-]{6,})", u)
+    if m:
+        return m.group(1)
+
+    # youtube.com/watch?v=VIDEO_ID
+    m = re.search(r"[?&]v=([a-zA-Z0-9_-]{6,})", u)
+    if m:
+        return m.group(1)
+
+    # youtube.com/shorts/VIDEO_ID
+    m = re.search(r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,})", u)
+    if m:
+        return m.group(1)
+
+    # youtube.com/embed/VIDEO_ID
+    m = re.search(r"youtube\.com/embed/([a-zA-Z0-9_-]{6,})", u)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def normalize_youtube_url(url: str) -> str:
+    vid = extract_youtube_id(url)
+    if not vid:
+        return url
+    # formato mais compatível com o player do Streamlit
+    return f"https://www.youtube.com/watch?v={vid}"
 
 
 # ======================================================
@@ -212,14 +249,10 @@ def read_sheet_with_hyperlinks(tab: str) -> pd.DataFrame:
             fv = str(cell.get("formattedValue", "") or "").strip()
             hl = str(cell.get("hyperlink", "") or "").strip()
 
-            # Se houver hyperlink (chip), preserva o link.
-            # Se o texto for vazio ou for um "nome de arquivo", ainda assim usamos o hyperlink.
-            # Se não houver hyperlink, usa o texto.
             if hl:
                 out_row.append(hl)
             else:
                 out_row.append(fv)
-        # garante tamanho
         if len(out_row) < len(headers):
             out_row += [""] * (len(headers) - len(out_row))
         rows.append(out_row[: len(headers)])
@@ -492,14 +525,12 @@ def render_media(item: dict, all_cols: list[str]):
     if "cover_photo_url" in all_cols:
         raw = str(item.get("cover_photo_url", "")).strip()
         if raw:
-            # Se for Drive: tenta baixar bytes via API (funciona com chip e também com link não público se estiver compartilhado com service account)
             fid = extract_drive_file_id(raw)
             if fid:
                 try:
                     b = drive_download_bytes(fid)
                     st.image(b, use_container_width=True)
                 except Exception:
-                    # fallback: tenta link direto
                     st.image(normalize_drive_direct_view(raw), use_container_width=True)
             else:
                 st.image(raw, use_container_width=True)
@@ -514,14 +545,17 @@ def render_media(item: dict, all_cols: list[str]):
                     b = drive_download_bytes(fidv)
                     st.video(b)
                 except Exception:
-                    # fallback: preview iframe (se carregar) ou link
                     prev = drive_preview_url(rawv)
                     if prev:
                         components.iframe(prev, height=420)
                     st.link_button("Abrir vídeo", rawv, use_container_width=True)
             else:
-                # YouTube ou mp4 direto
-                st.video(rawv)
+                # Fix definitivo: Shorts -> watch?v=ID
+                yt_id = extract_youtube_id(rawv)
+                if yt_id:
+                    st.video(normalize_youtube_url(rawv))
+                else:
+                    st.video(rawv)
 
 
 # ======================================================
