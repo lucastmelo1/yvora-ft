@@ -71,18 +71,14 @@ def extract_drive_file_id(url: str) -> str | None:
         return None
     u = url.strip()
 
-    # patterns comuns:
-    # https://drive.google.com/file/d/<ID>/view?...
     m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", u)
     if m:
         return m.group(1)
 
-    # https://drive.google.com/open?id=<ID>
     m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", u)
     if m:
         return m.group(1)
 
-    # https://drive.google.com/uc?export=view&id=<ID>
     m = re.search(r"/uc\?.*id=([a-zA-Z0-9_-]+)", u)
     if m:
         return m.group(1)
@@ -90,9 +86,6 @@ def extract_drive_file_id(url: str) -> str | None:
     return None
 
 def normalize_image_url(url: str) -> str:
-    """
-    Se for Drive, converte para link direto que o st.image consegue renderizar.
-    """
     if not url:
         return ""
     u = url.strip()
@@ -105,9 +98,6 @@ def normalize_image_url(url: str) -> str:
     return u
 
 def drive_preview_url(url: str) -> str | None:
-    """
-    Retorna um link /preview para vídeo do Drive (bom para iframe).
-    """
     if not url:
         return None
     u = url.strip()
@@ -117,12 +107,6 @@ def drive_preview_url(url: str) -> str | None:
     if not fid:
         return None
     return f"https://drive.google.com/file/d/{fid}/preview"
-
-def looks_like_youtube(url: str) -> bool:
-    if not url:
-        return False
-    u = url.strip().lower()
-    return ("youtube.com" in u) or ("youtu.be" in u)
 
 # ======================================================
 # GOOGLE SHEETS
@@ -137,7 +121,7 @@ def get_service():
     )
     return build("sheets", "v4", credentials=creds)
 
-@st.cache_data(ttl=30)  # curto para evitar "ver conteúdo velho"
+@st.cache_data(ttl=30)
 def read_sheet(tab: str) -> pd.DataFrame:
     service = get_service()
     result = service.spreadsheets().values().get(
@@ -153,9 +137,6 @@ def read_sheet(tab: str) -> pd.DataFrame:
     return pd.DataFrame(values[1:], columns=cols)
 
 def write_sheet(tab: str, df: pd.DataFrame):
-    """
-    Escreve a planilha inteira e depois limpa cache de leitura para recarregar.
-    """
     service = get_service()
     values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     service.spreadsheets().values().update(
@@ -165,7 +146,6 @@ def write_sheet(tab: str, df: pd.DataFrame):
         body={"values": values}
     ).execute()
 
-    # garante sincronismo visual imediato
     read_sheet.clear()
 
 # ======================================================
@@ -278,7 +258,7 @@ def header():
         col1, col2, col3 = st.columns([2, 2, 2])
         with col3:
             st.markdown('<div class="small-btn">', unsafe_allow_html=True)
-            if st.button("Trocar usuário", use_container_width=True):
+            if st.button("Trocar usuário", use_container_width=True, key="btn_trocar_usuario"):
                 logout()
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
@@ -383,7 +363,6 @@ def render_text_sections(item: dict, cols: list[str]):
         st.info("Sem informações preenchidas neste modo.")
 
 def render_media(item: dict, all_cols: list[str]):
-    # imagem
     if "cover_photo_url" in all_cols:
         raw = str(item.get("cover_photo_url", "")).strip()
         if raw:
@@ -394,17 +373,14 @@ def render_media(item: dict, all_cols: list[str]):
                 st.warning("Não consegui renderizar a imagem. Confira se o link é público. Vou mostrar o link abaixo.")
                 st.code(img)
 
-    # vídeo
     if "training_video_url" in all_cols:
         rawv = str(item.get("training_video_url", "")).strip()
         if rawv:
-            # Se for Drive, usar iframe preview
             prev = drive_preview_url(rawv)
             if prev:
                 components.iframe(prev, height=360)
                 st.link_button("Abrir vídeo", rawv, use_container_width=True)
             else:
-                # YouTube ou link direto
                 try:
                     st.video(rawv)
                 except Exception:
@@ -526,16 +502,11 @@ def main():
             st.warning("O item selecionado não pertence ao módulo atual.")
             st.rerun()
 
-    # ==================================================
-    # VISUAL
-    # ==================================================
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Novo item" if creating_new else str(item.get("name", "")))
 
-    # renderiza imagem e vídeo corretamente
     render_media(item, all_cols)
 
-    general_cols, extra_general = get_general_cols(all_cols)
     meta_parts = []
     for c in ["category", "yield", "total_time_min"]:
         if c in all_cols:
@@ -552,6 +523,7 @@ def main():
         mode_cols = get_mode_cols(all_cols, "training_")
         render_text_sections(item, mode_cols)
 
+    general_cols, extra_general = get_general_cols(all_cols)
     filled_extras = []
     for c in extra_general:
         v = str(item.get(c, "")).strip()
@@ -566,9 +538,6 @@ def main():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ==================================================
-    # ADMIN
-    # ==================================================
     if is_admin():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Administrador · Gerenciar item")
@@ -612,17 +581,6 @@ def main():
             for c in training_cols:
                 edited[c] = st.text_area(prettify_label(c), value=str(item.get(c, "")), height=120)
 
-        # outros campos
-        general_cols2, extra_general2 = get_general_cols(all_cols)
-        covered = set(BASE_ITEM_COLS) | set(general_cols2) | set(extra_general2) | set(service_cols) | set(training_cols)
-        other_cols = [c for c in all_cols if c not in covered]
-        if other_cols:
-            with st.expander("Outros campos (extras)", expanded=False):
-                for c in sorted(other_cols):
-                    if c in BASE_ITEM_COLS:
-                        continue
-                    edited[c] = st.text_input(prettify_label(c), value=str(item.get(c, "")))
-
         colS, colX = st.columns([2, 1])
         with colS:
             if st.button("Salvar (Admin)", type="primary", use_container_width=True):
@@ -663,9 +621,6 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ==================================================
-    # CHEFE
-    # ==================================================
     elif can_edit():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Chefe · Editar conteúdo")
@@ -701,7 +656,6 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ======================================================
-# START
+# START (IMPORTANTE: apenas 1 chamada)
 # ======================================================
-header()
 main()
