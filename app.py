@@ -1,12 +1,15 @@
-import streamlit as st
-import pandas as pd
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+import re
 import time
 from pathlib import Path
 
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
 # ======================================================
-# CONFIG GERAL
+# CONFIG
 # ======================================================
 st.set_page_config(
     page_title="Yvora | Fichas Técnicas",
@@ -61,6 +64,67 @@ def find_logo_path() -> str | None:
     return None
 
 # ======================================================
+# LINK HELPERS (Drive, YouTube, etc)
+# ======================================================
+def extract_drive_file_id(url: str) -> str | None:
+    if not url:
+        return None
+    u = url.strip()
+
+    # patterns comuns:
+    # https://drive.google.com/file/d/<ID>/view?...
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", u)
+    if m:
+        return m.group(1)
+
+    # https://drive.google.com/open?id=<ID>
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", u)
+    if m:
+        return m.group(1)
+
+    # https://drive.google.com/uc?export=view&id=<ID>
+    m = re.search(r"/uc\?.*id=([a-zA-Z0-9_-]+)", u)
+    if m:
+        return m.group(1)
+
+    return None
+
+def normalize_image_url(url: str) -> str:
+    """
+    Se for Drive, converte para link direto que o st.image consegue renderizar.
+    """
+    if not url:
+        return ""
+    u = url.strip()
+
+    if "drive.google.com" in u:
+        fid = extract_drive_file_id(u)
+        if fid:
+            return f"https://drive.google.com/uc?export=view&id={fid}"
+
+    return u
+
+def drive_preview_url(url: str) -> str | None:
+    """
+    Retorna um link /preview para vídeo do Drive (bom para iframe).
+    """
+    if not url:
+        return None
+    u = url.strip()
+    if "drive.google.com" not in u:
+        return None
+    fid = extract_drive_file_id(u)
+    if not fid:
+        return None
+    return f"https://drive.google.com/file/d/{fid}/preview"
+
+def looks_like_youtube(url: str) -> bool:
+    if not url:
+        return False
+    u = url.strip().lower()
+    return ("youtube.com" in u) or ("youtu.be" in u)
+
+# ======================================================
 # GOOGLE SHEETS
 # ======================================================
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -73,6 +137,7 @@ def get_service():
     )
     return build("sheets", "v4", credentials=creds)
 
+@st.cache_data(ttl=30)  # curto para evitar "ver conteúdo velho"
 def read_sheet(tab: str) -> pd.DataFrame:
     service = get_service()
     result = service.spreadsheets().values().get(
@@ -84,12 +149,13 @@ def read_sheet(tab: str) -> pd.DataFrame:
     if not values:
         return pd.DataFrame()
 
-    # garante colunas únicas
     cols = values[0]
-    df = pd.DataFrame(values[1:], columns=cols)
-    return df
+    return pd.DataFrame(values[1:], columns=cols)
 
 def write_sheet(tab: str, df: pd.DataFrame):
+    """
+    Escreve a planilha inteira e depois limpa cache de leitura para recarregar.
+    """
     service = get_service()
     values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     service.spreadsheets().values().update(
@@ -99,8 +165,11 @@ def write_sheet(tab: str, df: pd.DataFrame):
         body={"values": values}
     ).execute()
 
+    # garante sincronismo visual imediato
+    read_sheet.clear()
+
 # ======================================================
-# AUTH + PERMISSÕES POR MÓDULO (drinks/pratos)
+# AUTH
 # ======================================================
 ROLE_LABEL = {"viewer": "Cozinha", "editor": "Chefe", "admin": "Administrador"}
 REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "can_pratos"]
@@ -215,14 +284,10 @@ def header():
             st.markdown("</div>", unsafe_allow_html=True)
 
 # ======================================================
-# ITENS: helpers dinâmicos de campos
+# ITENS helpers
 # ======================================================
-BASE_ITEM_COLS = ["id", "type", "name"]  # mínimos para o app funcionar
-
-PREFERRED_GENERAL_ORDER = [
-    "name", "category", "tags", "yield", "total_time_min",
-    "cover_photo_url", "training_video_url"
-]
+BASE_ITEM_COLS = ["id", "type", "name"]
+PREFERRED_GENERAL_ORDER = ["name", "category", "tags", "yield", "total_time_min", "cover_photo_url", "training_video_url"]
 
 def ensure_item_min_schema(items: pd.DataFrame) -> pd.DataFrame:
     out = items.copy()
@@ -245,13 +310,11 @@ def next_id(items: pd.DataFrame, prefix: str) -> str:
     return f"{prefix}{str(n).zfill(3)}"
 
 def upsert_item(items: pd.DataFrame, item: dict) -> pd.DataFrame:
-    out = items.copy()
-    out = ensure_item_min_schema(out)
+    out = ensure_item_min_schema(items.copy())
     item_id = str(item.get("id", "")).strip()
     if not item_id:
         raise ValueError("ID do item não pode ser vazio.")
 
-    # garante que todas as chaves existam como colunas
     for k in item.keys():
         if k not in out.columns:
             out[k] = ""
@@ -275,26 +338,11 @@ def delete_item(items: pd.DataFrame, item_id: str) -> pd.DataFrame:
     return items[items["id"].astype(str) != str(item_id)].copy()
 
 def prettify_label(col: str) -> str:
-    # transforma snake_case em rótulo amigável
     s = col.replace("_", " ").strip()
-    return s[:1].upper() + s[1:]
-
-def render_text_sections(item: dict, cols: list[str]):
-    # mostra apenas campos com conteúdo
-    any_shown = False
-    for c in cols:
-        val = str(item.get(c, "")).strip()
-        if val:
-            any_shown = True
-            st.markdown(f"### {prettify_label(c)}")
-            st.text(val)
-    if not any_shown:
-        st.info("Sem informações preenchidas neste modo.")
+    return s[:1].upper() + s[1:] if s else col
 
 def get_mode_cols(all_cols: list[str], prefix: str) -> list[str]:
-    # retorna colunas por prefixo, mas respeita ordenação básica quando existir
     pref = [c for c in all_cols if c.startswith(prefix)]
-    # ordena: ingredients, steps, plating primeiro quando existirem
     priority = [
         f"{prefix}ingredients",
         f"{prefix}steps",
@@ -312,12 +360,8 @@ def get_mode_cols(all_cols: list[str], prefix: str) -> list[str]:
             ordered.append(c)
     return ordered
 
-def get_general_cols(all_cols: list[str]) -> list[str]:
-    gens = []
-    for c in PREFERRED_GENERAL_ORDER:
-        if c in all_cols:
-            gens.append(c)
-    # qualquer coluna que não seja base e não seja service_/training_ vai para "extras"
+def get_general_cols(all_cols: list[str]) -> tuple[list[str], list[str]]:
+    gens = [c for c in PREFERRED_GENERAL_ORDER if c in all_cols]
     extras = [
         c for c in all_cols
         if c not in gens
@@ -325,8 +369,46 @@ def get_general_cols(all_cols: list[str]) -> list[str]:
         and not c.startswith("service_")
         and not c.startswith("training_")
     ]
-    # mantemos ordem estável
     return gens, sorted(extras)
+
+def render_text_sections(item: dict, cols: list[str]):
+    any_shown = False
+    for c in cols:
+        val = str(item.get(c, "")).strip()
+        if val:
+            any_shown = True
+            st.markdown(f"### {prettify_label(c)}")
+            st.text(val)
+    if not any_shown:
+        st.info("Sem informações preenchidas neste modo.")
+
+def render_media(item: dict, all_cols: list[str]):
+    # imagem
+    if "cover_photo_url" in all_cols:
+        raw = str(item.get("cover_photo_url", "")).strip()
+        if raw:
+            img = normalize_image_url(raw)
+            try:
+                st.image(img, use_container_width=True)
+            except Exception:
+                st.warning("Não consegui renderizar a imagem. Confira se o link é público. Vou mostrar o link abaixo.")
+                st.code(img)
+
+    # vídeo
+    if "training_video_url" in all_cols:
+        rawv = str(item.get("training_video_url", "")).strip()
+        if rawv:
+            # Se for Drive, usar iframe preview
+            prev = drive_preview_url(rawv)
+            if prev:
+                components.iframe(prev, height=360)
+                st.link_button("Abrir vídeo", rawv, use_container_width=True)
+            else:
+                # YouTube ou link direto
+                try:
+                    st.video(rawv)
+                except Exception:
+                    st.link_button("Abrir vídeo", rawv, use_container_width=True)
 
 # ======================================================
 # APP
@@ -359,7 +441,6 @@ def main():
 
     auth = st.session_state["auth"]
 
-    # módulos permitidos
     allowed_modules = []
     if auth.get("role") == "admin":
         allowed_modules = ["Drinks", "Pratos"]
@@ -375,7 +456,6 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # seletores
     colA, colB, colC, colD = st.columns([1, 1, 2, 1])
     with colA:
         tipo = st.radio("Conteúdo", allowed_modules)
@@ -397,7 +477,6 @@ def main():
         st.error("Sem permissão para acessar este módulo.")
         return
 
-    # filtra itens
     df = items[items["type"].astype(str).str.lower() == tipo_val].copy()
 
     if busca and not df.empty:
@@ -406,7 +485,6 @@ def main():
         tags_ok = df["tags"].astype(str).str.lower().str.contains(b) if "tags" in df.columns else False
         df = df[name_ok | tags_ok]
 
-    # lista
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Itens")
     if df.empty:
@@ -427,14 +505,12 @@ def main():
 
     item_id = str(st.session_state["item"])
     creating_new = bool(st.session_state.get("creating_new", False))
-
     all_cols = list(items.columns)
 
     if creating_new:
         if not is_admin():
             st.error("Somente administrador pode criar itens.")
             return
-        # cria um item base, mas já com todas as colunas existentes na planilha
         item = {c: "" for c in all_cols}
         item["id"] = item_id
         item["type"] = tipo_val
@@ -445,23 +521,20 @@ def main():
             st.warning("Item não encontrado na base.")
             return
         item = match.iloc[0].to_dict()
-
         if str(item.get("type", "")).lower().strip() != tipo_val:
             st.session_state.pop("item", None)
             st.warning("O item selecionado não pertence ao módulo atual.")
             st.rerun()
 
     # ==================================================
-    # VISUALIZAÇÃO
+    # VISUAL
     # ==================================================
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.subheader("Novo item" if creating_new else str(item.get("name", "")))
 
-    cover = str(item.get("cover_photo_url", "")).strip()
-    if cover:
-        st.image(cover, use_container_width=True)
+    # renderiza imagem e vídeo corretamente
+    render_media(item, all_cols)
 
-    # gerais
     general_cols, extra_general = get_general_cols(all_cols)
     meta_parts = []
     for c in ["category", "yield", "total_time_min"]:
@@ -472,7 +545,6 @@ def main():
     if meta_parts:
         st.markdown(f"<div class='muted'>{' | '.join(meta_parts)}</div>", unsafe_allow_html=True)
 
-    # conteúdo por modo
     if modo == "Serviço":
         mode_cols = get_mode_cols(all_cols, "service_")
         render_text_sections(item, mode_cols)
@@ -480,13 +552,6 @@ def main():
         mode_cols = get_mode_cols(all_cols, "training_")
         render_text_sections(item, mode_cols)
 
-        # vídeo no treinamento, se existir
-        if "training_video_url" in all_cols:
-            vid = str(item.get("training_video_url", "")).strip()
-            if vid:
-                st.link_button("Assistir vídeo", vid, use_container_width=True)
-
-    # mostra campos gerais extras preenchidos (somente leitura)
     filled_extras = []
     for c in extra_general:
         v = str(item.get(c, "")).strip()
@@ -502,7 +567,7 @@ def main():
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ==================================================
-    # ADMIN CRUD COMPLETO
+    # ADMIN
     # ==================================================
     if is_admin():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -510,7 +575,6 @@ def main():
 
         edited = dict(item)
 
-        # campos base e gerais
         col1, col2 = st.columns([1, 1])
         with col1:
             edited["type"] = st.selectbox("Tipo", ["drink", "prato"], index=0 if tipo_val == "drink" else 1)
@@ -526,14 +590,14 @@ def main():
 
         if "tags" in all_cols:
             edited["tags"] = st.text_input("Tags (separadas por vírgula)", value=str(item.get("tags", "")))
+
         if "cover_photo_url" in all_cols:
-            edited["cover_photo_url"] = st.text_input("Foto capa (URL)", value=str(item.get("cover_photo_url", "")))
+            edited["cover_photo_url"] = st.text_input("Foto capa (URL, pode ser Drive)", value=str(item.get("cover_photo_url", "")))
         if "training_video_url" in all_cols:
-            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL)", value=str(item.get("training_video_url", "")))
+            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL, pode ser Drive)", value=str(item.get("training_video_url", "")))
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
-        # edita TODOS os campos service_
         service_cols = get_mode_cols(all_cols, "service_")
         with st.expander("Campos de Serviço (service_*)", expanded=True):
             if not service_cols:
@@ -541,7 +605,6 @@ def main():
             for c in service_cols:
                 edited[c] = st.text_area(prettify_label(c), value=str(item.get(c, "")), height=120)
 
-        # edita TODOS os campos training_
         training_cols = get_mode_cols(all_cols, "training_")
         with st.expander("Campos de Treinamento (training_*)", expanded=True):
             if not training_cols:
@@ -549,8 +612,9 @@ def main():
             for c in training_cols:
                 edited[c] = st.text_area(prettify_label(c), value=str(item.get(c, "")), height=120)
 
-        # edita quaisquer outros campos não cobertos
-        covered = set(BASE_ITEM_COLS) | set(general_cols) | set(extra_general) | set(service_cols) | set(training_cols)
+        # outros campos
+        general_cols2, extra_general2 = get_general_cols(all_cols)
+        covered = set(BASE_ITEM_COLS) | set(general_cols2) | set(extra_general2) | set(service_cols) | set(training_cols)
         other_cols = [c for c in all_cols if c not in covered]
         if other_cols:
             with st.expander("Outros campos (extras)", expanded=False):
@@ -566,8 +630,8 @@ def main():
                     items2 = upsert_item(items, edited)
                     write_sheet(items_tab, items2)
                     st.session_state["creating_new"] = False
-                    st.success("Salvo com sucesso.")
-                    time.sleep(0.4)
+                    st.success("Salvo e sincronizado com a planilha.")
+                    time.sleep(0.5)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Falha ao salvar: {e}")
@@ -587,8 +651,8 @@ def main():
                         write_sheet(items_tab, items2)
                         st.session_state.pop("confirm_delete", None)
                         st.session_state.pop("item", None)
-                        st.success("Item excluído.")
-                        time.sleep(0.4)
+                        st.success("Item excluído e sincronizado com a planilha.")
+                        time.sleep(0.5)
                         st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao excluir: {e}")
@@ -600,7 +664,7 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
 
     # ==================================================
-    # CHEFE: editar campos de conteúdo, mas sem mexer em name/type/id
+    # CHEFE
     # ==================================================
     elif can_edit():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -608,11 +672,10 @@ def main():
 
         edited = dict(item)
 
-        # chef pode editar conteúdo e links, mantendo título/tipo
         if "cover_photo_url" in all_cols:
-            edited["cover_photo_url"] = st.text_input("Foto capa (URL)", value=str(item.get("cover_photo_url", "")))
+            edited["cover_photo_url"] = st.text_input("Foto capa (URL, pode ser Drive)", value=str(item.get("cover_photo_url", "")))
         if "training_video_url" in all_cols:
-            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL)", value=str(item.get("training_video_url", "")))
+            edited["training_video_url"] = st.text_input("Vídeo treinamento (URL, pode ser Drive)", value=str(item.get("training_video_url", "")))
 
         service_cols = get_mode_cols(all_cols, "service_")
         training_cols = get_mode_cols(all_cols, "training_")
@@ -629,8 +692,8 @@ def main():
             try:
                 items2 = upsert_item(items, edited)
                 write_sheet(items_tab, items2)
-                st.success("Alterações salvas.")
-                time.sleep(0.4)
+                st.success("Alterações salvas e sincronizadas com a planilha.")
+                time.sleep(0.5)
                 st.rerun()
             except Exception as e:
                 st.error(f"Falha ao salvar: {e}")
@@ -640,4 +703,5 @@ def main():
 # ======================================================
 # START
 # ======================================================
+header()
 main()
