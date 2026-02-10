@@ -2,12 +2,11 @@ import io
 import re
 import time
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from google.oauthTFJGJW1zZSN3J64vHT89Dm_GW2ExdmdTtKvQnH7ndw.edit?gid=1916489109#gid=1916489109.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -109,28 +108,26 @@ def drive_preview_url(url: str) -> str | None:
     return f"https://drive.google.com/file/d/{fid}/preview"
 
 
-# ========= YouTube normalizer (fix definitivo para Shorts) =========
+# =============================
+# YouTube helpers (fix Shorts)
+# =============================
 def extract_youtube_id(url: str) -> str | None:
     if not url:
         return None
     u = url.strip()
 
-    # youtu.be/VIDEO_ID
     m = re.search(r"youtu\.be/([a-zA-Z0-9_-]{6,})", u)
     if m:
         return m.group(1)
 
-    # youtube.com/watch?v=VIDEO_ID
     m = re.search(r"[?&]v=([a-zA-Z0-9_-]{6,})", u)
     if m:
         return m.group(1)
 
-    # youtube.com/shorts/VIDEO_ID
     m = re.search(r"youtube\.com/shorts/([a-zA-Z0-9_-]{6,})", u)
     if m:
         return m.group(1)
 
-    # youtube.com/embed/VIDEO_ID
     m = re.search(r"youtube\.com/embed/([a-zA-Z0-9_-]{6,})", u)
     if m:
         return m.group(1)
@@ -142,14 +139,12 @@ def normalize_youtube_url(url: str) -> str:
     vid = extract_youtube_id(url)
     if not vid:
         return url
-    # formato mais compatível com o player do Streamlit
     return f"https://www.youtube.com/watch?v={vid}"
 
 
 # ======================================================
 # GOOGLE APIS
 # ======================================================
-# Precisamos de Sheets + Drive para ler chips e baixar mídia
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -233,7 +228,6 @@ def read_sheet_with_hyperlinks(tab: str) -> pd.DataFrame:
     if not rowData:
         return pd.DataFrame()
 
-    # Primeiro row = headers
     header_vals = rowData[0].get("values", [])
     headers: list[str] = []
     for cell in header_vals:
@@ -245,24 +239,20 @@ def read_sheet_with_hyperlinks(tab: str) -> pd.DataFrame:
     for r in rowData[1:]:
         vals = r.get("values", [])
         out_row: list[str] = []
-        for i, cell in enumerate(vals):
+        for cell in vals:
             fv = str(cell.get("formattedValue", "") or "").strip()
             hl = str(cell.get("hyperlink", "") or "").strip()
+            out_row.append(hl if hl else fv)
 
-            if hl:
-                out_row.append(hl)
-            else:
-                out_row.append(fv)
         if len(out_row) < len(headers):
             out_row += [""] * (len(headers) - len(out_row))
         rows.append(out_row[: len(headers)])
 
-    df = pd.DataFrame(rows, columns=headers)
-    return df
+    return pd.DataFrame(rows, columns=headers)
 
 
 def write_sheet(tab: str, df: pd.DataFrame):
-    """Escreve em RAW (texto). Hyperlinks viram texto do link, o que é ótimo para o app."""
+    """Escreve em RAW (texto). Hyperlinks viram texto do link."""
     ssid = st.secrets["SHEET_ID"]
     values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     sheets_service().spreadsheets().values().update(
@@ -298,10 +288,7 @@ REQUIRED_USER_COLS = ["username", "password", "role", "active", "can_drinks", "c
 
 
 def logout():
-    for k in [
-        "auth", "item", "login_user", "login_pass",
-        "confirm_delete", "creating_new",
-    ]:
+    for k in ["auth", "item", "login_user", "login_pass", "confirm_delete", "creating_new"]:
         st.session_state.pop(k, None)
 
 
@@ -550,7 +537,7 @@ def render_media(item: dict, all_cols: list[str]):
                         components.iframe(prev, height=420)
                     st.link_button("Abrir vídeo", rawv, use_container_width=True)
             else:
-                # Fix definitivo: Shorts -> watch?v=ID
+                # Ajuste solicitado: YouTube Shorts e variações
                 yt_id = extract_youtube_id(rawv)
                 if yt_id:
                     st.video(normalize_youtube_url(rawv))
@@ -567,7 +554,6 @@ def main():
     users_tab = st.secrets.get("USERS_TAB", "users")
     items_tab = st.secrets.get("ITEMS_TAB", "items")
 
-    # users não tem chip, pode ser leitura simples
     try:
         users = read_sheet_values(users_tab)
     except Exception as e:
@@ -581,7 +567,6 @@ def main():
             st.error(str(e))
         return
 
-    # items precisa ler hyperlinks de chip
     try:
         items = read_sheet_with_hyperlinks(items_tab)
         items = ensure_item_min_schema(items)
@@ -697,7 +682,7 @@ def main():
         mode_cols = get_mode_cols(all_cols, "training_")
         render_text_sections(item, mode_cols)
 
-    general_cols, extra_general = get_general_cols(all_cols)
+    _, extra_general = get_general_cols(all_cols)
     filled_extras = []
     for c in extra_general:
         v = str(item.get(c, "")).strip()
@@ -712,7 +697,7 @@ def main():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ADMIN CRUD completo com sync para planilha
+    # ADMIN CRUD com sync para planilha (mantido igual ao seu arquivo)
     if is_admin():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Administrador · Gerenciar item")
@@ -796,7 +781,6 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # EDITOR (Chefe)
     elif can_edit():
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.subheader("Chefe · Editar conteúdo")
@@ -828,8 +812,6 @@ def main():
                 st.rerun()
             except Exception as e:
                 st.error(f"Falha ao salvar: {e}")
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ======================================================
